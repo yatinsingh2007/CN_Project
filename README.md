@@ -24,6 +24,8 @@ Every step is captured and explained with Wireshark, `dig`, `curl` and browser D
 |---|---|---|---|
 | **Mac 1** | Client | Browser, curl, dig, Wireshark | — |
 | **Mac 2** | Server | dnsmasq · nginx · Backend A · Backend B | 53/UDP · 443, 80/TCP · 4000 · 6000 |
+| **Mac 1** *(Phase 2)* | Backup DNS · standby edge | dnsmasq · nginx on loopback | 127.0.0.1:53 · 127.0.0.1:443 |
+| **Mac 2** *(Phase 2)* | Isolation | pf rule on `en0` | blocks 4000 · 6000 from the LAN |
 
 Mac 1 is a college-managed laptop whose firewall blocks incoming connections, so all server roles run on Mac 2. See [docs/architecture.md](docs/architecture.md#why-all-server-roles-are-on-mac-2) for how we diagnosed this.
 
@@ -33,6 +35,7 @@ Mac 1 is a college-managed laptop whose firewall blocks incoming connections, so
 - **Edge:** nginx: reverse proxy, round-robin load balancing, passive failover, TLS termination
 - **TLS:** OpenSSL, self-generated local CA with SAN certificate
 - **Backends:** Node.js + Express
+- **Firewall (Phase 2):** macOS pf
 - **Analysis:** Wireshark, tcpdump, `dig`, `curl`, browser DevTools
 
 ## Repository structure
@@ -48,15 +51,25 @@ CN_Project/
 ├── docs/
 │   ├── architecture.md       Roles, ports, request flow by layer, design decisions
 │   └── topology.png
-└── evidence/phase1/
-    ├── A-network/            IP / subnet / gateway / MAC, ping both ways
-    ├── B-dns/                dnsmasq config, dig & nslookup from the client, query log
-    ├── C-backends/           Both backends running
-    ├── D-loadbalancer/       nginx config, round-robin A/B
-    ├── E-https/              Certificate, curl -v verify ok, browser padlock, redirect
-    ├── F-caching/            Cache-Control, ETag, 304, browser cache behaviour
-    ├── G-wireshark/          Full DNS → TCP → TLS → HTTP capture (.pcapng + screenshots)
-    └── failures/             Five failure demos + failures.md
+└── evidence/
+    ├── phase1/
+    │   ├── Phase1_Report_IEEE.pdf   Phase 1 report (IEEE format)
+    │   ├── A-network/            IP / subnet / gateway / MAC, ping both ways
+    │   ├── B-dns/                dnsmasq config, dig & nslookup from the client, query log
+    │   ├── C-backends/           Both backends running
+    │   ├── D-loadbalancer/       nginx config, round-robin A/B
+    │   ├── E-https/              Certificate, curl -v verify ok, browser padlock, redirect
+    │   ├── F-caching/            Cache-Control, ETag, 304, browser cache behaviour
+    │   ├── G-wireshark/          Full DNS → TCP → TLS → HTTP capture (.pcapng + screenshots)
+    │   └── failures/             Five failure demos + failures.md
+    └── Phase-2/
+        ├── Phase2_Report_IEEE.pdf   Phase 2 report (IEEE format)
+        ├── A-*.jpeg              Backup DNS answering from 127.0.0.1
+        ├── B-*.jpeg              TTL caching and cache flush
+        ├── C-*.jpeg              pf isolation: before, rules, after, rollback
+        ├── D-*.jpeg              Failover: both backends, then Backend A down
+        ├── E-*.jpeg              Standby edge and DNS cutover log
+        └── report-src/           LaTeX source of the Phase 2 report
 ```
 
 ## Running it (on Mac 2)
@@ -98,11 +111,31 @@ When finished, restore normal DNS on both Macs: `sudo networksetup -setdnsserver
 ## Project phases
 
 - **Phase 1 – Build & Observe** ✅ LAN, private DNS, backends, nginx load balancing, HTTPS, HTTP caching, packet-capture evidence, failure demos.
-- **Phase 2 – Harden & Recover:** backup DNS, TTL behaviour, backend firewall isolation, failover, DNS-based edge cutover, troubleshooting.
+- **Phase 2 – Harden & Recover** ✅ backup DNS, TTL behaviour, backend firewall isolation, failover, DNS-based edge cutover, troubleshooting.
+
+## Phase 2 – Harden & Recover
+
+| Ext. | What we built | How we showed it | Evidence |
+|---|---|---|---|
+| **A** Backup DNS | Second dnsmasq on Mac 1 (`127.0.0.1`), same records, `local-ttl=30` | Primary stopped → `dig` answered by `127.0.0.1#53`, site still loads | [A-backup-works](evidence/Phase-2/A-backup-works.jpeg) |
+| **B** TTL & record change | 30 s TTL on project records | Record changed on Mac 2; client keeps the cached IP until TTL expires; flush clears it | [B-ttl](evidence/Phase-2/B-ttl.jpeg), [B-flush](evidence/Phase-2/B-flush.jpeg) |
+| **C** Service isolation | pf: `block drop in quick on en0 … port { 4000 6000 }`, `set skip on lo0` | Direct `:4000` times out; `https://app.team1.test` still works; rolled back with `pfctl -f /etc/pf.conf` | [before](evidence/Phase-2/C-before.jpeg), [rules](evidence/Phase-2/C-rules.jpeg), [after](evidence/Phase-2/C-after.jpeg), [rollback](evidence/Phase-2/C-rollback.jpeg) |
+| **D** HA failover | nginx `max_fails=1 fail_timeout=10s` + `proxy_next_upstream` | Backend A stopped → every request served by B, no errors | [D-before](evidence/Phase-2/D-before.jpeg), [D-a-down](evidence/Phase-2/D-a-down.jpeg) |
+| **E** Edge cutover | Standby nginx on Mac 1 with the same certificate, `X-Edge` header on both edges | DNS record moved to standby → responses switch `X-Edge: mac2` → `mac1` after the TTL, no failures or cert warnings | [standby](evidence/Phase-2/E-standby-ready.jpeg), [cutover](evidence/Phase-2/e-cutover.jpeg) |
+| **F** Troubleshooting | Layer-by-layer method: `dig` → `ping` → `nc -vz` → `openssl s_client` → `curl -v` → nginx error log | Faults met during Phase 2 and their fixes are in the report | [report §VIII](evidence/Phase-2/Phase2_Report_IEEE.pdf) |
+
+**Single point of failure:** Mac 2 still hosts the primary DNS, the primary edge and both backends. Removing it would need a second edge sharing a floating IP (VRRP/keepalived) or DNS failover, with backends on separate hosts.
+
+Because Mac 1 cannot accept LAN connections, the backup resolver and standby edge listen on its loopback and serve Mac 1 itself (the client in every test).
+
+## Reports
+
+- [Phase 1 report (IEEE format)](evidence/phase1/Phase1_Report_IEEE.pdf)
+- [Phase 2 report (IEEE format)](evidence/Phase-2/Phase2_Report_IEEE.pdf)
 
 ## Team
 
 | Member | Machine | Responsibilities |
 |---|---|---|
 | Yatin Singh | Mac 2 (server) | DNS, nginx, TLS, backends |
-| Dadi Dinesh | Mac 1 (client) | Client setup, Wireshark capture, testing |
+| Dadi Dinesh | Mac 1 (client) | Client setup, Wireshark capture, testing, backup DNS and standby edge (Phase 2) |
